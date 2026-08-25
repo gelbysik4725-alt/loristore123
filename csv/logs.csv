@@ -1,0 +1,4 @@
+id,event,user,ip,time
+1,login,ivan@mail.ru,1.2.3.4,2026-03-10 12:00
+2,purchase,anna@mail.ru,5.6.7.8,2026-03-11 09:15
+3,error,system,127.0.0.1,2026-03-11 10:00
