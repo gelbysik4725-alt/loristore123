@@ -1,26 +1,29 @@
 <?php
 /**
- * CSV SEARCH — Google Drive (large file, streaming)
- * Дизайн в стиле LORI
+ * CSV SEARCH — Google Drive / local file
+ * Без обязательного curl, потоковый поиск
  */
-error_reporting(0);
+error_reporting(E_ALL);
+ini_set('display_errors', '1');
 date_default_timezone_set('Europe/Moscow');
 header('X-Content-Type-Options: nosniff');
-header('X-Frame-Options: DENY');
 set_time_limit(300);
 ini_set('memory_limit', '256M');
 
-// ========== НАСТРОЙКИ ==========
-$DRIVE_ID   = '13zk3qz9juPRXhIlJYPDC1XKPQVxKNMvN';
-$CACHE_DIR  = sys_get_temp_dir() . '/csv_search_cache';
-$CACHE_FILE = $CACHE_DIR . '/data_' . $DRIVE_ID . '.csv';
-$CACHE_TTL  = 3600 * 6; // кэш 6 часов
-$MAX_RESULTS = 100;
-$DELIMITER  = ','; // если ; — поменяй
-// ==============================
+// ===== НАСТРОЙКИ =====
+$DRIVE_ID    = '13zk3qz9juPRXhIlJYPDC1XKPQVxKNMvN';
+$LOCAL_CSV   = __DIR__ . '/data.csv';           // если положишь файл рядом — возьмёт его
+$CACHE_DIR   = __DIR__ . '/cache';
+$CACHE_FILE  = $CACHE_DIR . '/drive_data.csv';
+$CACHE_TTL   = 6 * 3600;
+$MAX_RESULTS = 80;
+$DELIMITER   = ','; // или ';'
+// =====================
 
-$query = isset($_GET['q']) ? trim($_GET['q']) : '';
-$forceRefresh = isset($_GET['refresh']);
+$query = isset($_GET['q']) ? trim((string)$_GET['q']) : '';
+$refresh = isset($_GET['refresh']);
+
+function h($s) { return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
 
 function u8lower($s) {
     $s = strtolower((string)$s);
@@ -32,165 +35,157 @@ function u8lower($s) {
     ]);
 }
 
-/** Скачать большой файл с Google Drive (с confirm для >100MB) */
-function downloadDriveFile($fileId, $dest) {
-    $dir = dirname($dest);
-    if (!is_dir($dir)) @mkdir($dir, 0775, true);
-
-    $url = 'https://drive.google.com/uc?export=download&id=' . urlencode($fileId);
-
-    // 1) Первый запрос — может вернуть HTML с confirm
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 5,
-        CURLOPT_TIMEOUT => 60,
-        CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; CSVSearch/1.0)',
-        CURLOPT_HEADER => true,
-        CURLOPT_SSL_VERIFYPEER => true,
-    ]);
-    $resp = curl_exec($ch);
-    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    $headers = substr($resp, 0, $headerSize);
-    $body = substr($resp, $headerSize);
-    curl_close($ch);
-
-    // Ищем confirm-токен и cookie
-    $confirm = null;
-    if (preg_match('/confirm=([0-9A-Za-z_-]+)/', $body, $m)) {
-        $confirm = $m[1];
-    } elseif (preg_match('/name="confirm"\s+value="([^"]+)"/', $body, $m)) {
-        $confirm = $m[1];
+function httpGet($url, $maxBytes = 0) {
+    $opts = [
+        'http' => [
+            'method' => 'GET',
+            'header' => "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nAccept: */*\r\n",
+            'timeout' => 120,
+            'follow_location' => 1,
+            'ignore_errors' => true,
+        ],
+        'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
+    ];
+    if ($maxBytes > 0) {
+        // partial not easy with file_get_contents; full get
     }
-    // иногда токен в UUID-форме в ссылке download
-    if (!$confirm && preg_match('/\/uc\?export=download[^"\']*confirm=([0-9A-Za-z_-]+)/', $body, $m)) {
-        $confirm = $m[1];
+    $ctx = stream_context_create($opts);
+    $data = @file_get_contents($url, false, $ctx);
+    return $data === false ? null : $data;
+}
+
+function downloadDriveTo($fileId, $dest) {
+    if (!is_dir(dirname($dest))) {
+        @mkdir(dirname($dest), 0775, true);
     }
 
-    $cookie = '';
-    if (preg_match_all('/^Set-Cookie:\s*([^;]+)/mi', $headers, $cm)) {
-        $cookie = implode('; ', $cm[1]);
-    }
+    $urls = [
+        'https://drive.usercontent.google.com/download?id=' . rawurlencode($fileId) . '&export=download&confirm=t',
+        'https://drive.google.com/uc?export=download&id=' . rawurlencode($fileId) . '&confirm=t',
+        'https://drive.google.com/uc?export=download&id=' . rawurlencode($fileId),
+    ];
 
-    // 2) Если файл маленький — body уже CSV
-    $trim = ltrim($body);
-    if ($trim !== '' && $trim[0] !== '<' && strpos($trim, 'Google Drive') === false) {
-        return file_put_contents($dest, $body) !== false;
-    }
+    foreach ($urls as $url) {
+        // потоковая запись
+        $in = @fopen($url, 'r', false, stream_context_create([
+            'http' => [
+                'method' => 'GET',
+                'header' => "User-Agent: Mozilla/5.0\r\n",
+                'timeout' => 0,
+                'follow_location' => 1,
+                'ignore_errors' => true,
+            ],
+            'ssl' => ['verify_peer' => false, 'verify_peer_name' => false],
+        ]));
+        if (!$in) continue;
 
-    // 3) Большой файл — качаем с confirm
-    $dlUrl = 'https://drive.google.com/uc?export=download&id=' . urlencode($fileId);
-    if ($confirm) $dlUrl .= '&confirm=' . urlencode($confirm);
-    // альтернативный путь
-    $dlUrl2 = 'https://drive.usercontent.google.com/download?id=' . urlencode($fileId) . '&export=download&confirm=t';
+        $out = @fopen($dest, 'w');
+        if (!$out) { fclose($in); continue; }
 
-    foreach ([$dlUrl, $dlUrl2] as $tryUrl) {
-        $fp = fopen($dest, 'w');
-        if (!$fp) return false;
-        $ch = curl_init($tryUrl);
-        curl_setopt_array($ch, [
-            CURLOPT_FILE => $fp,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_TIMEOUT => 0,
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; CSVSearch/1.0)',
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_COOKIE => $cookie,
-            CURLOPT_HTTPHEADER => ['Accept-Language: en-US,en;q=0.9'],
-        ]);
-        $ok = curl_exec($ch);
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $size = curl_getinfo($ch, CURLINFO_SIZE_DOWNLOAD);
-        curl_close($ch);
-        fclose($fp);
-
-        // проверка: не HTML-страница ли
-        if ($ok && $code >= 200 && $code < 400 && $size > 1000) {
-            $head = file_get_contents($dest, false, null, 0, 200);
-            if ($head !== false && strpos(ltrim($head), '<') !== 0 && stripos($head, 'DOCTYPE') === false) {
-                return true;
+        $written = 0;
+        while (!feof($in)) {
+            $chunk = fread($in, 1024 * 256);
+            if ($chunk === false || $chunk === '') break;
+            // если в начале HTML — отмена
+            if ($written === 0 && (isset($chunk[0]) && $chunk[0] === '<' || stripos($chunk, '<!DOCTYPE') !== false || stripos($chunk, '<html') !== false)) {
+                fclose($in); fclose($out); @unlink($dest); break;
             }
+            fwrite($out, $chunk);
+            $written += strlen($chunk);
+        }
+        fclose($in);
+        fclose($out);
+
+        if ($written > 500 && file_exists($dest)) {
+            return true;
         }
         @unlink($dest);
     }
     return false;
 }
 
-function ensureCache($driveId, $cacheFile, $ttl, $force = false) {
-    $need = $force || !file_exists($cacheFile) || (time() - filemtime($cacheFile) > $ttl) || filesize($cacheFile) < 100;
-    if (!$need) return ['ok' => true, 'cached' => true, 'size' => filesize($cacheFile)];
-
-    $ok = downloadDriveFile($driveId, $cacheFile);
-    if (!$ok || !file_exists($cacheFile) || filesize($cacheFile) < 100) {
-        return ['ok' => false, 'error' => 'Не удалось скачать файл с Google Drive. Проверь, что доступ «Все, у кого есть ссылка».'];
+function resolveCsvPath($local, $cache, $driveId, $ttl, $refresh) {
+    // 1) локальный файл рядом со скриптом
+    if (is_file($local) && filesize($local) > 100) {
+        return ['path' => $local, 'source' => 'local', 'size' => filesize($local)];
     }
-    return ['ok' => true, 'cached' => false, 'size' => filesize($cacheFile)];
+    // 2) кэш
+    if (!$refresh && is_file($cache) && filesize($cache) > 100 && (time() - filemtime($cache) < $ttl)) {
+        return ['path' => $cache, 'source' => 'cache', 'size' => filesize($cache)];
+    }
+    // 3) скачать с Drive
+    if (downloadDriveTo($driveId, $cache)) {
+        return ['path' => $cache, 'source' => 'drive', 'size' => filesize($cache)];
+    }
+    return null;
 }
 
 function searchCsv($path, $query, $delimiter, $maxResults) {
-    $results = [];
-    $headers = null;
-    $scanned = 0;
     $fh = @fopen($path, 'r');
-    if (!$fh) return [null, [], 0];
+    if (!$fh) return [null, [], 0, 'Не открыть файл'];
 
-    // BOM
     $bom = fread($fh, 3);
     if ($bom !== "\xEF\xBB\xBF") rewind($fh);
 
     $headers = fgetcsv($fh, 0, $delimiter);
-    if (!$headers) { fclose($fh); return [null, [], 0]; }
+    if (!$headers) { fclose($fh); return [null, [], 0, 'Пустой CSV или неверный разделитель']; }
     $headers = array_map('trim', $headers);
 
+    // авто-детект ; если одна колонка и есть ;
+    if (count($headers) === 1 && strpos($headers[0], ';') !== false) {
+        rewind($fh);
+        $bom = fread($fh, 3);
+        if ($bom !== "\xEF\xBB\xBF") rewind($fh);
+        $delimiter = ';';
+        $headers = fgetcsv($fh, 0, $delimiter);
+        $headers = array_map('trim', $headers);
+    }
+
     $q = $query !== '' ? u8lower($query) : '';
+    $results = [];
+    $scanned = 0;
 
     while (($data = fgetcsv($fh, 0, $delimiter)) !== false) {
         $scanned++;
-        if (count($data) === 1 && ($data[0] === null || $data[0] === '')) continue;
+        if ($data === [null] || $data === false) continue;
 
         $row = [];
-        foreach ($headers as $i => $h) {
-            $row[$h] = isset($data[$i]) ? trim((string)$data[$i]) : '';
+        foreach ($headers as $i => $name) {
+            $row[$name] = isset($data[$i]) ? trim((string)$data[$i]) : '';
         }
 
         if ($q === '') {
-            // без запроса — только первые N
-            if (count($results) < $maxResults) $results[] = $row;
+            if (count($results) < min(20, $maxResults)) $results[] = $row;
             continue;
         }
 
-        $hay = u8lower(implode(' ', array_values($row)));
+        $hay = u8lower(implode(' ', $row));
         if (strpos($hay, $q) !== false) {
             $results[] = $row;
             if (count($results) >= $maxResults) break;
         }
     }
     fclose($fh);
-    return [$headers, $results, $scanned];
+    return [$headers, $results, $scanned, null];
 }
 
-// --- логика ---
-$status = ensureCache($DRIVE_ID, $CACHE_FILE, $CACHE_TTL, $forceRefresh);
-$error = null;
-$headers = [];
-$results = [];
-$scanned = 0;
-$fileSize = 0;
+$err = null;
+$info = resolveCsvPath($LOCAL_CSV, $CACHE_FILE, $DRIVE_ID, $CACHE_TTL, $refresh);
 
-if (!$status['ok']) {
-    $error = $status['error'];
+if (!$info) {
+    $err = 'Не удалось получить CSV. Варианты: 1) Положи data.csv рядом с index.php  2) Открой доступ к файлу на Drive: «Все, у кого есть ссылка».';
+    $headers = []; $results = []; $scanned = 0; $fileSize = 0; $source = '-';
 } else {
-    $fileSize = $status['size'];
-    list($headers, $results, $scanned) = searchCsv($CACHE_FILE, $query, $DELIMITER, $MAX_RESULTS);
-    if ($headers === null) $error = 'Не удалось прочитать CSV. Возможно, другой разделитель (попробуй ;).';
+    $fileSize = $info['size'];
+    $source = $info['source'];
+    list($headers, $results, $scanned, $readErr) = searchCsv($info['path'], $query, $DELIMITER, $MAX_RESULTS);
+    if ($readErr) $err = $readErr;
 }
 
 $count = count($results);
-function h($s) { return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
-function highlight($text, $q) {
+function hl($text, $q) {
     if ($q === '' || $text === '') return h($text);
-    return preg_replace('/('.preg_quote($q, '/').')/iu', '<mark>$1</mark>', h($text));
+    return preg_replace('/('.preg_quote($q,'/').')/iu', '<mark>$1</mark>', h($text));
 }
 ?>
 <!DOCTYPE html>
@@ -198,91 +193,88 @@ function highlight($text, $q) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CSV SEARCH · Drive</title>
+<title>CSV SEARCH</title>
 <style>
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#030303;--surface:rgba(12,12,15,.72);--border:rgba(255,255,255,.08);--accent:#22c55e;--accent-dim:#16a34a;--text:#e5e5e5;--muted:#55555f;--soft:#a1a1aa}
-body{min-height:100vh;background:var(--bg);font-family:Inter,system-ui,sans-serif;color:var(--text);-webkit-font-smoothing:antialiased;line-height:1.5}
-body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background:radial-gradient(ellipse at 20% 10%,rgba(34,197,94,.12),transparent 55%),radial-gradient(ellipse at 85% 90%,rgba(34,197,94,.07),transparent 50%)}
-.wrap{max-width:900px;margin:0 auto;padding:48px 20px 80px}
-.logo{text-align:center;font-size:11px;letter-spacing:10px;color:var(--accent);font-weight:600;margin-bottom:8px}
-.sub{text-align:center;font-size:9.5px;color:var(--muted);letter-spacing:3px;text-transform:uppercase;margin-bottom:28px}
-.search-wrap{position:relative;margin-bottom:16px}
-input[type=search]{width:100%;padding:15px 50px 15px 18px;background:rgba(0,0,0,.4);border:1px solid var(--border);border-radius:13px;color:#fff;font-family:inherit;font-size:14.5px;outline:none;transition:.18s}
-input[type=search]::placeholder{color:var(--muted)}
+body{min-height:100vh;background:#030303;font-family:Inter,system-ui,sans-serif;color:#e5e5e5;-webkit-font-smoothing:antialiased}
+body::before{content:"";position:fixed;inset:0;z-index:-1;background:radial-gradient(ellipse at 20% 10%,rgba(34,197,94,.12),transparent 55%),radial-gradient(ellipse at 85% 90%,rgba(34,197,94,.07),transparent 50%)}
+.wrap{max-width:900px;margin:0 auto;padding:48px 20px 70px}
+.logo{text-align:center;font-size:11px;letter-spacing:10px;color:#22c55e;font-weight:600;margin-bottom:8px}
+.sub{text-align:center;font-size:9.5px;color:#55555f;letter-spacing:3px;text-transform:uppercase;margin-bottom:28px}
+.search-wrap{position:relative;margin-bottom:14px}
+input[type=search]{width:100%;padding:15px 50px 15px 18px;background:rgba(0,0,0,.4);border:1px solid rgba(255,255,255,.08);border-radius:13px;color:#fff;font:inherit;font-size:14.5px;outline:none}
 input[type=search]:focus{border-color:rgba(34,197,94,.6);box-shadow:0 0 0 3px rgba(34,197,94,.13)}
-.btn-go{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:36px;height:36px;border:none;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent-dim));color:#04120a;cursor:pointer;display:flex;align-items:center;justify-content:center}
-.btn-go:hover{filter:brightness(1.08)}
+input[type=search]::placeholder{color:#55555f}
+.btn-go{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:36px;height:36px;border:0;border-radius:10px;background:linear-gradient(135deg,#22c55e,#16a34a);color:#04120a;cursor:pointer;display:flex;align-items:center;justify-content:center}
 .btn-go svg{width:16px;height:16px}
-.meta{font-size:12px;color:var(--muted);margin-bottom:14px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
-.meta b{color:var(--accent);font-weight:600}
-.meta a{color:var(--soft);font-size:11px}
-.panel{border:1px solid var(--border);border-radius:22px;overflow:hidden;background:var(--surface);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);box-shadow:0 30px 70px -30px #000,0 0 50px rgba(34,197,94,.07);animation:in .35s cubic-bezier(.2,.8,.2,1)}
-@keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-.row{padding:14px 18px;border-bottom:1px solid var(--border)}
-.row:last-child{border-bottom:none}
+.meta{font-size:12px;color:#55555f;margin-bottom:14px;display:flex;flex-wrap:wrap;gap:10px 18px}
+.meta b{color:#22c55e}
+.meta a{color:#a1a1aa}
+.err{background:rgba(190,40,40,.14);border:1px solid rgba(248,113,113,.3);color:#fca5a5;padding:14px 16px;border-radius:13px;font-size:13px;margin-bottom:16px;line-height:1.6}
+.panel{border:1px solid rgba(255,255,255,.08);border-radius:22px;overflow:hidden;background:rgba(12,12,15,.72);backdrop-filter:blur(18px);box-shadow:0 30px 70px -30px #000}
+.row{padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.08)}
+.row:last-child{border-bottom:0}
 .row:hover{background:rgba(34,197,94,.04)}
-.cells{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px 14px}
-.cell-label{font-size:10px;color:var(--muted);letter-spacing:.04em;margin-bottom:2px}
-.cell-val{font-size:13px;color:var(--text);word-break:break-word}
-.cell-val mark{background:rgba(34,197,94,.28);color:#fff;border-radius:3px;padding:0 2px}
-.empty{text-align:center;padding:48px 20px;color:var(--muted);font-size:13px}
-.empty b{display:block;color:var(--soft);font-size:15px;margin-bottom:8px}
-.err{background:rgba(190,40,40,.14);border:1px solid rgba(248,113,113,.28);color:#fca5a5;padding:14px 16px;border-radius:13px;font-size:13px;margin-bottom:16px;line-height:1.5}
-.foot{margin-top:40px;text-align:center;font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--muted)}
-.foot span{color:var(--accent-dim)}
-::selection{background:rgba(34,197,94,.3);color:#fff}
+.cells{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px 12px}
+.cell-label{font-size:10px;color:#55555f;margin-bottom:2px}
+.cell-val{font-size:13px;word-break:break-word}
+mark{background:rgba(34,197,94,.28);color:#fff;border-radius:3px;padding:0 2px}
+.empty{text-align:center;padding:40px 16px;color:#55555f}
+.empty b{display:block;color:#a1a1aa;font-size:15px;margin-bottom:6px}
+.foot{margin-top:36px;text-align:center;font-size:10px;letter-spacing:3px;text-transform:uppercase;color:#55555f}
+.foot span{color:#16a34a}
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="logo">CSV SEARCH</div>
-  <div class="sub">Google Drive · streaming</div>
+  <div class="sub">Drive / local · streaming</div>
 
-  <?php if ($error): ?>
-    <div class="err"><?= h($error) ?><br><br>
-      Проверь доступ к файлу: «Все, у кого есть ссылка» → Читатель.<br>
-      <a href="?refresh=1" style="color:#22c55e">Повторить загрузку</a>
-    </div>
+  <?php if ($err): ?>
+  <div class="err">
+    <?= h($err) ?><br><br>
+    <b>Как починить:</b><br>
+    1. Положи файл как <code>data.csv</code> в ту же папку, что и index.php<br>
+    2. Или на Drive: доступ «Все, у кого есть ссылка» → Читатель<br>
+    3. <a href="?refresh=1" style="color:#22c55e">Повторить загрузку с Drive</a>
+  </div>
   <?php endif; ?>
 
-  <form class="search-wrap" method="get">
-    <input type="search" name="q" placeholder="Поиск по базе…" value="<?= h($query) ?>" autofocus autocomplete="off">
-    <button class="btn-go" type="submit" aria-label="Искать">
+  <form class="search-wrap" method="get" action="">
+    <input type="search" name="q" placeholder="Поиск…" value="<?= h($query) ?>" autofocus autocomplete="off">
+    <button class="btn-go" type="submit" aria-label="search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
     </button>
   </form>
 
+  <?php if (!$err): ?>
   <div class="meta">
-    <?php if (!$error): ?>
-      <span>Найдено <b><?= $count ?></b><?= $count >= $MAX_RESULTS ? ' (лимит)' : '' ?></span>
-      <span>Просмотрено строк: <b><?= number_format($scanned, 0, '', ' ') ?></b></span>
-      <span>Файл: <b><?= round($fileSize / 1048576, 1) ?> МБ</b></span>
-      <a href="?refresh=1<?= $query !== '' ? '&q='.urlencode($query) : '' ?>">Обновить с Drive</a>
-    <?php endif; ?>
+    <span>Найдено <b><?= (int)$count ?></b></span>
+    <span>Строк просмотрено <b><?= number_format($scanned, 0, '.', ' ') ?></b></span>
+    <span>Файл <b><?= round($fileSize/1048576, 1) ?> МБ</b> (<?= h($source) ?>)</span>
+    <a href="?refresh=1<?= $query!=='' ? '&q='.urlencode($query) : '' ?>">Обновить</a>
   </div>
+  <?php endif; ?>
 
-  <?php if (!$error && $count === 0): ?>
-    <div class="panel empty"><b>Ничего не найдено</b>Измените запрос</div>
-  <?php elseif (!$error): ?>
+  <?php if (!$err && $count === 0): ?>
+    <div class="panel empty"><b>Ничего не найдено</b>Введите другой запрос</div>
+  <?php elseif (!$err): ?>
     <div class="panel">
       <?php foreach ($results as $row): ?>
-        <div class="row">
-          <div class="cells">
-            <?php foreach ($headers as $col): ?>
-              <div>
-                <div class="cell-label"><?= h($col) ?></div>
-                <div class="cell-val"><?= highlight($row[$col] ?? '', $query) ?></div>
-              </div>
-            <?php endforeach; ?>
-          </div>
-        </div>
+        <div class="row"><div class="cells">
+          <?php foreach ($headers as $col): ?>
+            <div>
+              <div class="cell-label"><?= h($col) ?></div>
+              <div class="cell-val"><?= hl($row[$col] ?? '', $query) ?></div>
+            </div>
+          <?php endforeach; ?>
+        </div></div>
       <?php endforeach; ?>
     </div>
   <?php endif; ?>
 
-  <div class="foot">CSV Search · <span>Drive</span></div>
+  <div class="foot">CSV Search · <span>fixed</span></div>
 </div>
 </body>
 </html>
