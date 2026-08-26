@@ -1,7 +1,8 @@
 <?php
 /**
- * CSV SEARCH v2 — несколько баз + SQLite + отчёт
- * Render Free: файлы живут до сна/редеплоя
+ * CSV SEARCH v2.1 — Multi + SQLite + авто-инициализация из /csv
+ * Папка csv в репозитории = исходные базы (живут вечно)
+ * /data = рабочие SQLite (эфемерные на Render Free)
  */
 error_reporting(0);
 date_default_timezone_set('Europe/Moscow');
@@ -12,10 +13,13 @@ ini_set('upload_max_filesize', '300M');
 ini_set('post_max_size', '300M');
 ini_set('max_execution_time', '600');
 
-$DATA_DIR = __DIR__ . '/data';
-if (!is_dir($DATA_DIR)) @mkdir($DATA_DIR, 0775, true);
+$DATA_DIR   = __DIR__ . '/data';      // рабочие SQLite (эфемерные)
+$SOURCE_DIR = __DIR__ . '/csv';       // исходные CSV из GitHub (постоянные)
+$MAX_SHOW   = 200;
 
-$MAX_SHOW = 200; // сколько строк показывать на экране
+if (!is_dir($DATA_DIR))   @mkdir($DATA_DIR, 0775, true);
+if (!is_dir($SOURCE_DIR)) @mkdir($SOURCE_DIR, 0775, true);
+
 $query    = isset($_GET['q']) ? trim((string)$_GET['q']) : '';
 $dbSelect = isset($_GET['db']) ? trim((string)$_GET['db']) : 'all';
 $msg = $err = '';
@@ -40,7 +44,8 @@ function safeName($name) {
 }
 
 function detectDelimiter($path) {
-    $head = file_get_contents($path, false, null, 0, 4000);
+    $head = @file_get_contents($path, false, null, 0, 4000);
+    if ($head === false) return ',';
     $sc = substr_count($head, ';');
     $cc = substr_count($head, ',');
     $tc = substr_count($head, "\t");
@@ -70,17 +75,15 @@ function importCsvToSqlite($csvPath, $sqlitePath, $table = 'data') {
     $pdo->exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
 
     $fh = fopen($csvPath, 'r');
-    if (!$fh) throw new Exception('Не удалось открыть CSV');
+    if (!$fh) throw new Exception('Не удалось открыть CSV: ' . basename($csvPath));
 
-    // BOM
     $bom = fread($fh, 3);
     if ($bom !== "\xEF\xBB\xBF") rewind($fh);
 
     $headers = fgetcsv($fh, 0, $delimiter);
-    if (!$headers) { fclose($fh); throw new Exception('Нет заголовков'); }
+    if (!$headers) { fclose($fh); throw new Exception('Нет заголовков в ' . basename($csvPath)); }
     $headers = array_map('trim', $headers);
 
-    // если одна колонка и внутри точки с запятой — перечитываем
     if (count($headers) === 1 && strpos($headers[0], ';') !== false) {
         rewind($fh);
         $bom = fread($fh, 3);
@@ -89,12 +92,10 @@ function importCsvToSqlite($csvPath, $sqlitePath, $table = 'data') {
         $headers = array_map('trim', fgetcsv($fh, 0, $delimiter));
     }
 
-    // чистые имена колонок
     $cols = [];
     foreach ($headers as $i => $h) {
         $c = preg_replace('/[^a-zA-Z0-9_\p{L}]/u', '_', $h);
         $c = $c === '' ? 'col_' . $i : $c;
-        // уникальность
         $base = $c; $n = 1;
         while (isset($cols[$c])) { $c = $base . '_' . $n++; }
         $cols[$c] = true;
@@ -106,7 +107,6 @@ function importCsvToSqlite($csvPath, $sqlitePath, $table = 'data') {
     $colDefs = array_map(fn($c) => "\"$c\" TEXT", $headers);
     $pdo->exec('CREATE TABLE "' . $table . '" (' . implode(',', $colDefs) . ')');
 
-    // поисковый индекс по всем колонкам через FTS (если есть) или обычный
     $placeholders = implode(',', array_fill(0, count($headers), '?'));
     $colList = '"' . implode('","', $headers) . '"';
     $stmt = $pdo->prepare("INSERT INTO \"$table\" ($colList) VALUES ($placeholders)");
@@ -114,7 +114,6 @@ function importCsvToSqlite($csvPath, $sqlitePath, $table = 'data') {
     $pdo->beginTransaction();
     $count = 0;
     while (($row = fgetcsv($fh, 0, $delimiter)) !== false) {
-        // выравниваем длину
         $row = array_pad(array_slice($row, 0, count($headers)), count($headers), '');
         $row = array_map('trim', $row);
         $stmt->execute($row);
@@ -126,13 +125,45 @@ function importCsvToSqlite($csvPath, $sqlitePath, $table = 'data') {
     }
     $pdo->commit();
     fclose($fh);
-
-    // простой индекс для LIKE (на больших таблицах всё равно будет sequential, но лучше чем CSV)
-    // Для очень больших баз можно добавить FTS5, но пока оставим просто и надёжно
     return [$headers, $count];
 }
 
-// ---------- upload ----------
+/**
+ * Авто-инициализация всех CSV из папки csv (GitHub)
+ * Запускается при каждом запросе, но реально импортирует только если SQLite отсутствует или устарел
+ */
+function autoInitFromSource($sourceDir, $dataDir) {
+    if (!is_dir($sourceDir)) return 0;
+    $imported = 0;
+    $files = array_merge(
+        glob($sourceDir . '/*.csv') ?: [],
+        glob($sourceDir . '/*.txt') ?: [],
+        glob($sourceDir . '/*.tsv') ?: []
+    );
+    foreach ($files as $csv) {
+        $base = safeName(basename($csv));
+        $sqlite = $dataDir . '/' . $base . '.sqlite';
+        // Импортируем, если нет SQLite или исходный CSV новее
+        if (!file_exists($sqlite) || filemtime($csv) > filemtime($sqlite)) {
+            try {
+                @copy($csv, $dataDir . '/' . $base . '.csv');
+                importCsvToSqlite($csv, $sqlite);
+                $imported++;
+            } catch (Throwable $e) {
+                // пропускаем битые файлы
+            }
+        }
+    }
+    return $imported;
+}
+
+// ========== АВТО-ИНИЦИАЛИЗАЦИЯ ИЗ ПАПКИ csv ==========
+$autoImported = autoInitFromSource($SOURCE_DIR, $DATA_DIR);
+if ($autoImported > 0) {
+    $msg = "Автоматически инициализировано баз из /csv: <b>$autoImported</b>";
+}
+
+// ---------- ручная загрузка ----------
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv'])) {
     $f = $_FILES['csv'];
     if ($f['error'] === UPLOAD_ERR_OK) {
@@ -158,10 +189,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv'])) {
                            round($size / 1048576, 1) . " МБ";
                 } catch (Throwable $e) {
                     @unlink($sqliteDest);
-                    $err = 'Ошибка импорта в SQLite: ' . $e->getMessage();
+                    $err = 'Ошибка импорта: ' . $e->getMessage();
                 }
             } else {
-                $err = 'Не удалось сохранить файл. На Free Render иногда мало места.';
+                $err = 'Не удалось сохранить файл.';
             }
         }
     } else {
@@ -177,7 +208,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv'])) {
     }
 }
 
-// ---------- delete ----------
+// ---------- удаление ----------
 if (isset($_GET['delete']) && $_GET['delete'] !== '') {
     $del = safeName($_GET['delete']);
     @unlink($DATA_DIR . '/' . $del . '.csv');
@@ -186,7 +217,7 @@ if (isset($_GET['delete']) && $_GET['delete'] !== '') {
     exit;
 }
 
-// ---------- export report ----------
+// ---------- экспорт отчёта ----------
 if (isset($_GET['export']) && $query !== '') {
     $dbs = listDatabases($DATA_DIR);
     $toSearch = $dbSelect === 'all' ? array_keys($dbs) : [$dbSelect];
@@ -197,22 +228,18 @@ if (isset($_GET['export']) && $query !== '') {
         if (!isset($dbs[$name])) continue;
         $pdo = new PDO('sqlite:' . $dbs[$name]['sqlite']);
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
         $cols = $pdo->query('PRAGMA table_info(data)')->fetchAll(PDO::FETCH_COLUMN, 1);
         if (!$cols) continue;
         if ($headersOut === null) $headersOut = $cols;
 
-        $where = [];
-        $params = [];
+        $where = []; $params = [];
         $q = u8lower($query);
         foreach ($cols as $c) {
             $where[] = "LOWER(\"$c\") LIKE ?";
             $params[] = '%' . $q . '%';
         }
-        $sql = 'SELECT * FROM data WHERE ' . implode(' OR ', $where);
-        $stmt = $pdo->prepare($sql);
+        $stmt = $pdo->prepare('SELECT * FROM data WHERE ' . implode(' OR ', $where));
         $stmt->execute($params);
-
         while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
             $row['_source'] = $name;
             $allRows[] = $row;
@@ -221,7 +248,7 @@ if (isset($_GET['export']) && $query !== '') {
 
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="report_' . date('Y-m-d_H-i') . '.csv"');
-    echo "\xEF\xBB\xBF"; // BOM
+    echo "\xEF\xBB\xBF";
     $out = fopen('php://output', 'w');
     if ($headersOut) {
         fputcsv($out, array_merge(['_source'], $headersOut), ';');
@@ -235,11 +262,11 @@ if (isset($_GET['export']) && $query !== '') {
     exit;
 }
 
-// ---------- search ----------
+// ---------- поиск ----------
 $databases = listDatabases($DATA_DIR);
-$results   = [];
+$results = [];
 $totalFound = 0;
-$headers   = [];
+$headers = [];
 $scannedDbs = 0;
 
 if ($query !== '' && $databases) {
@@ -253,8 +280,7 @@ if ($query !== '' && $databases) {
         if (!$cols) continue;
         if (!$headers) $headers = $cols;
 
-        $where = [];
-        $params = [];
+        $where = []; $params = [];
         foreach ($cols as $c) {
             $where[] = "LOWER(\"$c\") LIKE ?";
             $params[] = '%' . $q . '%';
@@ -263,14 +289,11 @@ if ($query !== '' && $databases) {
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
 
-        $cnt = 0;
         while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
             $row['_source'] = $name;
             $results[] = $row;
-            $cnt++;
             if (count($results) >= $MAX_SHOW) break 2;
         }
-        // примерное количество (для скорости не делаем COUNT(*) на огромных таблицах каждый раз)
         $scannedDbs++;
     }
     $totalFound = count($results);
@@ -339,19 +362,22 @@ mark{background:rgba(34,197,94,.28);color:#fff;border-radius:3px;padding:0 2px}
 <body>
 <div class="wrap">
   <div class="logo">CSV SEARCH</div>
-  <div class="sub">Multi · SQLite · Report</div>
+  <div class="sub">Multi · SQLite · Auto-init from /csv</div>
 
   <?php if ($msg): ?><div class="ok"><?= $msg ?></div><?php endif; ?>
   <?php if ($err): ?><div class="err"><?= h($err) ?></div><?php endif; ?>
 
   <div class="card">
-    <h2>Загрузить базу</h2>
+    <h2>Загрузить базу вручную</h2>
     <form method="post" enctype="multipart/form-data" class="upload-row">
       <input type="file" name="csv" accept=".csv,.txt,.tsv" required>
       <button class="btn" type="submit">Залить и инициализировать</button>
     </form>
-    <p class="hint">Можно заливать несколько файлов подряд. Каждый становится отдельной базой (CSV + SQLite).</p>
-    <p class="warn">⚠ Render Free: после сна сервиса всё пропадёт — нужно залить заново. Пока сервис бодрствует — работает быстро.</p>
+    <p class="hint">
+      Основные базы лежат в папке <b>csv/</b> репозитория — они инициализируются автоматически при старте.<br>
+      Здесь можно дополнительно заливать временные базы.
+    </p>
+    <p class="warn">⚠ Render Free: после сна рабочие файлы пропадают, но базы из /csv подтянутся сами при следующем запросе.</p>
 
     <?php if ($databases): ?>
     <div class="db-list">
@@ -411,7 +437,7 @@ mark{background:rgba(34,197,94,.28);color:#fff;border-radius:3px;padding:0 2px}
       <?php endforeach; ?>
     </div>
     <?php if ($totalFound >= $MAX_SHOW): ?>
-      <p class="hint" style="margin-top:12px">Показаны первые <?= $MAX_SHOW ?> строк. Чтобы получить <b>все</b> совпадения — нажми «Скачать отчёт».</p>
+      <p class="hint" style="margin-top:12px">Показаны первые <?= $MAX_SHOW ?> строк. Чтобы получить все совпадения — нажми «Скачать отчёт».</p>
     <?php endif; ?>
   <?php endif; ?>
 
@@ -420,10 +446,14 @@ mark{background:rgba(34,197,94,.28);color:#fff;border-radius:3px;padding:0 2px}
   <?php endif; ?>
 
   <?php else: ?>
-    <div class="panel empty"><b>Баз ещё нет</b>Залей хотя бы один CSV выше</div>
+    <div class="panel empty">
+      <b>Баз пока нет</b>
+      Положи CSV-файлы в папку <code>csv/</code> репозитория и сделай push,<br>
+      либо залей файл вручную выше.
+    </div>
   <?php endif; ?>
 
-  <div class="foot">CSV Search · <span>multi + sqlite</span></div>
+  <div class="foot">CSV Search · <span>auto from /csv</span></div>
 </div>
 </body>
 </html>
